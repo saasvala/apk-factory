@@ -15,9 +15,7 @@ on:
       product_id:
         description: 'Product ID in database'
         required: false
-      supabase_url:
-        description: 'Supabase URL for callback'
-        required: false
+        default: ''
 
 jobs:
   build:
@@ -33,7 +31,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -46,89 +44,130 @@ jobs:
         run: |
           git clone ${{ github.event.inputs.repo_url }} target-app
           cd target-app
-          echo "Repo cloned: ${{ github.event.inputs.app_slug }}"
+          echo "=== Repo cloned: ${{ github.event.inputs.app_slug }} ==="
           ls -la
 
-      - name: Install dependencies & build
+      - name: Install dependencies
         run: |
           cd target-app
           if [ -f "package.json" ]; then
-            npm install --legacy-peer-deps 2>/dev/null || npm install --force 2>/dev/null || echo "npm install failed, trying yarn"
-            if [ -f "yarn.lock" ]; then
-              yarn install 2>/dev/null || echo "yarn install failed"
-            fi
-            npm run build 2>/dev/null || npx vite build 2>/dev/null || echo "Build step skipped"
+            npm install --legacy-peer-deps 2>/dev/null || npm install --force 2>/dev/null || echo "npm install done with warnings"
           fi
+
+      - name: Build web app
+        run: |
+          cd target-app
+          WEB_DIR="dist"
+          if [ -f "package.json" ]; then
+            npm run build 2>/dev/null || npx vite build 2>/dev/null || echo "No build step"
+          fi
+          if [ -d "dist" ]; then
+            WEB_DIR="dist"
+          elif [ -d "build" ]; then
+            WEB_DIR="build"
+          elif [ -d "public" ]; then
+            WEB_DIR="public"
+          else
+            mkdir -p dist
+            SLUG="${{ github.event.inputs.app_slug }}"
+            echo "<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>$SLUG</title></head><body><div id=app><h1>$SLUG</h1><p>Powered by Software Vala</p></div></body></html>" > dist/index.html
+            WEB_DIR="dist"
+          fi
+          echo "WEB_DIR=$WEB_DIR" >> $GITHUB_ENV
 
       - name: Setup Capacitor
         run: |
           cd target-app
-          npm install @capacitor/core @capacitor/cli @capacitor/android --legacy-peer-deps 2>/dev/null || npm install @capacitor/core @capacitor/cli @capacitor/android --force
+          WEB_DIR="${{ env.WEB_DIR }}"
+          if [ -z "$WEB_DIR" ]; then WEB_DIR="dist"; fi
           
-          # Initialize Capacitor
-          npx cap init "${{ github.event.inputs.app_slug }}" "${{ github.event.inputs.package_name }}" --web-dir dist 2>/dev/null || \
-          npx cap init "${{ github.event.inputs.app_slug }}" "${{ github.event.inputs.package_name }}" --web-dir build 2>/dev/null || \
-          npx cap init "${{ github.event.inputs.app_slug }}" "${{ github.event.inputs.package_name }}" --web-dir public 2>/dev/null || \
-          echo "Cap init with fallback"
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest --legacy-peer-deps 2>/dev/null || npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest --force
           
-          # Ensure web dir exists
-          if [ ! -d "dist" ] && [ ! -d "build" ]; then
-            mkdir -p dist
-            echo "<html><head><title>${{ github.event.inputs.app_slug }}</title></head><body><h1>${{ github.event.inputs.app_slug }}</h1><p>Software Vala Product</p></body></html>" > dist/index.html
-          fi
+          cat > capacitor.config.json << EOF
+          {
+            "appId": "${{ github.event.inputs.package_name }}",
+            "appName": "${{ github.event.inputs.app_slug }}",
+            "webDir": "$WEB_DIR",
+            "server": { "androidScheme": "https" }
+          }
+          EOF
           
-          npx cap add android
-          npx cap sync
+          npx cap add android 2>/dev/null || true
+          npx cap sync android
 
       - name: Build APK
         run: |
           cd target-app/android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tail -50
           
-          # Find the APK
-          APK_PATH=$(find . -name "*.apk" -type f | head -1)
-          if [ -n "$APK_PATH" ]; then
-            cp "$APK_PATH" /tmp/${{ github.event.inputs.app_slug }}.apk
+          APK_FILE=$(find . -name "*.apk" -type f | head -1)
+          if [ -n "$APK_FILE" ]; then
+            mkdir -p /tmp/apk-out
+            cp "$APK_FILE" "/tmp/apk-out/${{ github.event.inputs.app_slug }}.apk"
+            APK_SIZE=$(stat -c%s "$APK_FILE" 2>/dev/null || echo "0")
             echo "APK_BUILT=true" >> $GITHUB_ENV
-            echo "APK built: $APK_PATH"
-            ls -la "$APK_PATH"
+            echo "APK_SIZE=$APK_SIZE" >> $GITHUB_ENV
+            echo "✅ APK built: $APK_SIZE bytes"
           else
             echo "APK_BUILT=false" >> $GITHUB_ENV
-            echo "No APK found!"
+            echo "❌ No APK found"
+            exit 1
           fi
 
-      - name: Upload APK artifact
+      - name: Upload APK to Storage
+        if: env.APK_BUILT == 'true'
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          APK_FILE="/tmp/apk-out/${{ github.event.inputs.app_slug }}.apk"
+          STORAGE_PATH="${{ github.event.inputs.app_slug }}/release.apk"
+          
+          echo "Uploading APK to storage bucket..."
+          HTTP_CODE=$(curl -s -o /tmp/upload.txt -w "%{http_code}" \
+            -X POST "$SB_URL/storage/v1/object/apks/$STORAGE_PATH" \
+            -H "Authorization: Bearer $SB_KEY" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            -H "x-upsert: true" \
+            --data-binary @"$APK_FILE")
+          
+          echo "Upload HTTP: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            echo "UPLOAD_OK=true" >> $GITHUB_ENV
+            echo "✅ Uploaded to apks/$STORAGE_PATH"
+          else
+            cat /tmp/upload.txt
+            echo "UPLOAD_OK=false" >> $GITHUB_ENV
+          fi
+
+      - name: Save artifact backup
         if: env.APK_BUILT == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.app_slug }}-apk
-          path: /tmp/${{ github.event.inputs.app_slug }}.apk
+          path: /tmp/apk-out/${{ github.event.inputs.app_slug }}.apk
           retention-days: 30
 
-      - name: Notify build complete
+      - name: Callback to pipeline
         if: always()
+        env:
+          SB_URL: ${{ secrets.SUPABASE_URL }}
+          SB_ANON: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
-          SUPABASE_URL="${{ github.event.inputs.supabase_url }}"
-          if [ -z "$SUPABASE_URL" ]; then
-            SUPABASE_URL="https://astmdnelnuqwpdbyzecr.supabase.co"
-          fi
-          
           if [ "${{ env.APK_BUILT }}" = "true" ]; then
             STATUS="success"
           else
             STATUS="failed"
           fi
           
-          curl -s -X POST "$SUPABASE_URL/functions/v1/apk-factory" \
+          SLUG="${{ github.event.inputs.app_slug }}"
+          PID="${{ github.event.inputs.product_id }}"
+          
+          curl -s -X POST "$SB_URL/functions/v1/apk-factory" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer sb_publishable_8ABOyFH7IzBbhO6MdmXC7Q_TDthFevw" \
-            -d "{
-              \"action\": \"build_complete\",
-              \"data\": {
-                \"slug\": \"${{ github.event.inputs.app_slug }}\",
-                \"status\": \"$STATUS\",
-                \"product_id\": \"${{ github.event.inputs.product_id }}\",
-                \"apk_path\": \"${{ github.event.inputs.app_slug }}/release.apk\"
-              }
-            }" || echo "Callback failed"
+            -H "Authorization: Bearer $SB_ANON" \
+            -d "{\"action\":\"build_complete\",\"data\":{\"slug\":\"$SLUG\",\"status\":\"$STATUS\",\"product_id\":\"$PID\",\"apk_path\":\"$SLUG/release.apk\",\"error\":\"\"}}" \
+            || echo "Callback failed"
+          
+          echo "Callback sent: status=$STATUS"
